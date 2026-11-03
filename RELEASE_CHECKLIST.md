@@ -45,6 +45,6 @@ gh release create vX.Y.Z --title "Herdr Pane Picker X.Y.Z" --notes "<highlights>
 - [ ] CI is green for the tagged commit.
 - [ ] `herdr plugin install ugurtarlig/herdr-pane-picker --ref vX.Y.Z --yes`
       (unlink a local dev copy first: `herdr plugin unlink ugurtarlig.pane-picker`).
-- [ ] `herdr plugin action invoke ugurtarlig.pane-picker.show` draws hints.
+- [ ] `herdr plugin action invoke ugurtarlig.pane-picker.open` draws hints.
 - [ ] The listing on https://herdr.dev/plugins/ shows the new version
       (index refreshes roughly every 30 minutes).

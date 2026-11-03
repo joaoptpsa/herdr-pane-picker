@@ -7,6 +7,29 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- Works with Herdr 0.9.2 and newer, which removed the pane graphics API the
+  hints were drawn with. The picker now opens a popup over the whole pane area
+  and paints a dimmed copy of every pane with its hint badge on top, plus a
+  legend box listing each hint with the pane's name.
+- Hints use a Colemak-DH home-row-first alphabet (`arst…`); set
+  `HERDR_PANE_PICKER_ALPHABET` to choose other letters.
+- Runs on Linux as well as macOS.
+- Badges are standard Kitty graphics images with a plain letter underneath,
+  so terminals without image support still show the hint.
+
+### Added
+
+- A zoomed tab hints only the zoomed pane, lists every pane in the legend, and
+  unzooms before focusing a hidden one.
+
+### Removed
+
+- The popup-free WezTerm integration and the `show`, `choose` and `cancel`
+  commands, which depended on the removed graphics API.
+- The `[experimental] kitty_graphics` requirement.
+
 ## [0.1.1] - 2026-07-18
 
 ### Changed

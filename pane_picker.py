@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""WezTerm-style character hint picker for Herdr panes."""
+"""WezTerm-style character hint picker for Herdr panes.
+
+Herdr 0.9.2 removed the API that let a plugin draw over another pane, so the
+picker opens a popup that covers the whole pane area and paints a dimmed copy
+of every pane underneath, a hint badge over each one, and a legend box.
+"""
 
 from __future__ import annotations
 
@@ -9,65 +14,57 @@ import itertools
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
+import string
 import sys
 import termios
 import time
 import tty
+import unicodedata
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 PLUGIN_ID = "ugurtarlig.pane-picker"
-HINT_ALPHABET = "asdfghjklqwertyuiopzxcvbnm"
+# Colemak-DH home row first, then the top and bottom rows.
+DEFAULT_HINT_ALPHABET = "arstgmneioqwfpbjluyzxcdvkh"
+ALPHABET_ENV = "HERDR_PANE_PICKER_ALPHABET"
 BADGE_GRID_COLS = 8
 BADGE_GRID_ROWS = 4
+# The fallback letter sits inside the badge artwork's opaque area, so a
+# terminal that renders the image hides it and one that does not shows it.
+FALLBACK_BADGE_COLS = 5
 # The badge artwork is authored in a fixed 64-unit coordinate space; rendered
 # output is BADGE_IMAGE_SIZE so the terminal never has to upscale.
 BADGE_DESIGN_SIZE = 64
 BADGE_IMAGE_SIZE = 128
 BADGE_SUPERSAMPLE = 4
+# Kitty graphics payloads must be sent in chunks of at most 4096 bytes.
+KITTY_CHUNK_SIZE = 4096
 REQUEST_IDS = itertools.count(1)
 SYSTEM_BADGE_FONTS = (
     "/System/Library/Fonts/SFNSRounded.ttf",
     "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf",
 )
 BADGE_ASSET_DIR = Path(__file__).resolve().parent / "assets" / "badges"
-OVERLAY_STATE_PATH = Path.home() / ".local" / "state" / "herdr-pane-picker" / "selection.json"
-OVERLAY_TIMEOUT_SECONDS = 6.0
+# A full-size popup covers the pane area exactly and spends one cell on its
+# border, so pane-area cell (x, y) is popup cell (x - 1, y - 1).
+POPUP_BORDER = 1
+POPUP_SIZE = "100%"
 
-# Compact 5x7 glyphs keep the plugin dependency-free. Hints are rendered as
-# uppercase shapes for legibility but selected with their lowercase key.
-FONT_5X7 = {
-    char: tuple(rows.split("/"))
-    for char, rows in {
-        "A": "01110/10001/10001/11111/10001/10001/10001",
-        "B": "11110/10001/10001/11110/10001/10001/11110",
-        "C": "01111/10000/10000/10000/10000/10000/01111",
-        "D": "11110/10001/10001/10001/10001/10001/11110",
-        "E": "11111/10000/10000/11110/10000/10000/11111",
-        "F": "11111/10000/10000/11110/10000/10000/10000",
-        "G": "01111/10000/10000/10111/10001/10001/01111",
-        "H": "10001/10001/10001/11111/10001/10001/10001",
-        "I": "11111/00100/00100/00100/00100/00100/11111",
-        "J": "00111/00010/00010/00010/10010/10010/01100",
-        "K": "10001/10010/10100/11000/10100/10010/10001",
-        "L": "10000/10000/10000/10000/10000/10000/11111",
-        "M": "10001/11011/10101/10101/10001/10001/10001",
-        "N": "10001/11001/10101/10011/10001/10001/10001",
-        "O": "01110/10001/10001/10001/10001/10001/01110",
-        "P": "11110/10001/10001/11110/10000/10000/10000",
-        "Q": "01110/10001/10001/10001/10101/10010/01101",
-        "R": "11110/10001/10001/11110/10100/10010/10001",
-        "S": "01111/10000/10000/01110/00001/00001/11110",
-        "T": "11111/00100/00100/00100/00100/00100/00100",
-        "U": "10001/10001/10001/10001/10001/10001/01110",
-        "V": "10001/10001/10001/10001/10001/01010/00100",
-        "W": "10001/10001/10001/10101/10101/10101/01010",
-        "X": "10001/10001/01010/00100/01010/10001/10001",
-        "Y": "10001/10001/01010/00100/00100/00100/00100",
-        "Z": "11111/00001/00010/00100/01000/10000/11111",
-    }.items()
-}
+ESC = "\x1b"
+RESET = f"{ESC}[0m"
+SNAPSHOT_STYLE = f"{ESC}[2;90m"
+DIVIDER_STYLE = f"{ESC}[90m"
+FALLBACK_BADGE_STYLE = f"{ESC}[1;97;44m"
+LEGEND_STYLE = f"{ESC}[0;39;49m"
+LEGEND_BORDER_STYLE = f"{ESC}[34m"
+LEGEND_HINT_STYLE = f"{ESC}[1;34m"
+LEGEND_DIM_STYLE = f"{ESC}[2m"
+LEGEND_TITLE_STYLE = f"{ESC}[1m"
+
+Rect = Tuple[int, int, int, int]
+Request = Callable[[str, Mapping[str, Any]], Dict[str, Any]]
 
 
 class HerdrApiError(RuntimeError):
@@ -126,6 +123,18 @@ def api_request(method: str, params: Mapping[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def hint_alphabet(environ: Mapping[str, str] = os.environ) -> str:
+    """The hint letters, in assignment order; badges exist for a-z only."""
+
+    alphabet = environ.get(ALPHABET_ENV, "").strip().lower() or DEFAULT_HINT_ALPHABET
+    invalid = sorted(set(alphabet) - set(string.ascii_lowercase))
+    if invalid:
+        raise RuntimeError(f"{ALPHABET_ENV} may only hold letters a-z, not {''.join(invalid)!r}")
+    if len(set(alphabet)) != len(alphabet):
+        raise RuntimeError(f"{ALPHABET_ENV} repeats a letter: {alphabet!r}")
+    return alphabet
+
+
 def spatial_panes(layout: Mapping[str, Any]) -> List[Dict[str, Any]]:
     panes = [dict(pane) for pane in layout.get("panes", []) if isinstance(pane, dict)]
     return sorted(
@@ -140,7 +149,7 @@ def spatial_panes(layout: Mapping[str, Any]) -> List[Dict[str, Any]]:
 
 def assign_hints(
     layout: Mapping[str, Any],
-    alphabet: str = HINT_ALPHABET,
+    alphabet: str = DEFAULT_HINT_ALPHABET,
     excluded_pane_ids: Iterable[str] = (),
 ) -> List[Tuple[str, Dict[str, Any]]]:
     excluded = set(excluded_pane_ids)
@@ -152,139 +161,148 @@ def assign_hints(
     return list(zip(alphabet, panes))
 
 
-def graphics_cell_size(
-    pane_id: str,
-    request: Callable[[str, Mapping[str, Any]], Dict[str, Any]] = api_request,
-) -> Tuple[int, int]:
-    try:
-        info = request("pane.graphics.info", {"pane_id": pane_id})
-    except HerdrApiError as error:
-        message = error.message.lower()
-        if "cell size" in message and "unavailable" in message:
-            raise RuntimeError(
-                "Restart this Herdr client once: kitty_graphics was enabled after it started."
-            ) from error
-        raise
-    cell_width = int(info.get("cell_width_px", 0))
-    cell_height = int(info.get("cell_height_px", 0))
-    if cell_width <= 0 or cell_height <= 0:
-        raise RuntimeError(
-            "Restart this Herdr client once: it has not reported terminal pixel geometry."
-        )
-    return cell_width, cell_height
+def rect_tuple(rect: Mapping[str, Any]) -> Rect:
+    return (
+        int(rect.get("x", 0)),
+        int(rect.get("y", 0)),
+        max(0, int(rect.get("width", 0))),
+        max(0, int(rect.get("height", 0))),
+    )
 
 
-def badge_placement(rect: Mapping[str, Any]) -> Dict[str, int]:
-    width = max(0, int(rect.get("width", 0)))
-    height = max(0, int(rect.get("height", 0)))
-    return {
-        "viewport_col": max(0, (width - BADGE_GRID_COLS) // 2),
-        "viewport_row": max(0, (height - BADGE_GRID_ROWS) // 2),
-        "grid_cols": min(BADGE_GRID_COLS, max(1, width)),
-        "grid_rows": min(BADGE_GRID_ROWS, max(1, height)),
-    }
+def border_style(panes: Sequence[Tuple[Rect, Optional[int]]]) -> str:
+    """How Herdr frames the panes, read from the rows each one gives up.
+
+    "boxed" frames every pane (pane_gaps). Otherwise panes share dividers, and
+    "outer" adds a frame around the whole area (pane_outer_borders).
+    """
+
+    lost = [(rect, rect[3] - rows) for rect, rows in panes if rows is not None]
+    if lost and all(rows >= 2 for _, rows in lost):
+        return "boxed"
+    if any(rect[1] == 0 and rows >= 1 for rect, rows in lost):
+        return "outer"
+    return "none"
 
 
-def _blend_pixel(
-    pixels: bytearray, width: int, x: int, y: int, color: Tuple[int, int, int, int]
-) -> None:
-    offset = (y * width + x) * 4
-    source_alpha = color[3] / 255.0
-    if source_alpha <= 0:
-        return
-    destination_alpha = pixels[offset + 3] / 255.0
-    output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha)
-    if output_alpha <= 0:
-        return
-    for channel in range(3):
-        source = color[channel] / 255.0
-        destination = pixels[offset + channel] / 255.0
-        output = (
-            source * source_alpha
-            + destination * destination_alpha * (1.0 - source_alpha)
-        ) / output_alpha
-        pixels[offset + channel] = round(output * 255)
-    pixels[offset + 3] = round(output_alpha * 255)
+def content_rect(rect: Rect, area: Rect, border: str) -> Rect:
+    """Where a pane's terminal cells sit inside its layout rect.
+
+    A shared divider belongs to the pane right of or below it, so a pane away
+    from the area's left or top edge gives up that cell.
+    """
+
+    x, y, width, height = rect
+    if border == "boxed":
+        return (x + 1, y + 1, max(0, width - 2), max(0, height - 2))
+    area_x, area_y, area_width, area_height = area
+    outer = 1 if border == "outer" else 0
+    left = 1 if x > area_x else outer
+    top = 1 if y > area_y else outer
+    right = outer if x + width >= area_x + area_width else 0
+    bottom = outer if y + height >= area_y + area_height else 0
+    return (x + left, y + top, max(0, width - left - right), max(0, height - top - bottom))
 
 
-def _inside_rounded_rect(x: int, y: int, width: int, height: int, radius: int) -> bool:
-    if radius <= 0:
-        return True
-    near_left = x < radius
-    near_right = x >= width - radius
-    near_top = y < radius
-    near_bottom = y >= height - radius
-    if not ((near_left or near_right) and (near_top or near_bottom)):
-        return True
-    center_x = radius if near_left else width - radius - 1
-    center_y = radius if near_top else height - radius - 1
-    dx = x - center_x
-    dy = y - center_y
-    return dx * dx + dy * dy <= radius * radius
+def to_popup(x: int, y: int) -> Tuple[int, int]:
+    return x - POPUP_BORDER, y - POPUP_BORDER
 
 
-def _paint_rounded_rect(
-    pixels: bytearray,
-    canvas_width: int,
-    x0: int,
-    y0: int,
-    width: int,
-    height: int,
-    radius: int,
-    color: Tuple[int, int, int, int],
-) -> None:
-    for y in range(height):
-        for x in range(width):
-            if _inside_rounded_rect(x, y, width, height, radius):
-                _blend_pixel(pixels, canvas_width, x0 + x, y0 + y, color)
+def badge_rect(rect: Rect) -> Rect:
+    """The badge footprint, centred on the pane and clamped to fit it."""
+
+    x, y, width, height = rect
+    cols = min(BADGE_GRID_COLS, max(1, width))
+    rows = min(BADGE_GRID_ROWS, max(1, height))
+    return (x + max(0, (width - cols) // 2), y + max(0, (height - rows) // 2), cols, rows)
 
 
-def _paint_rounded_gradient(
-    pixels: bytearray,
-    canvas_width: int,
-    x0: int,
-    y0: int,
-    width: int,
-    height: int,
-    radius: int,
-    top: Tuple[int, int, int, int],
-    bottom: Tuple[int, int, int, int],
-) -> None:
-    denominator = max(1, height - 1)
-    for y in range(height):
-        ratio = y / denominator
-        color = tuple(
-            round(top[channel] + (bottom[channel] - top[channel]) * ratio)
-            for channel in range(4)
-        )
-        for x in range(width):
-            if _inside_rounded_rect(x, y, width, height, radius):
-                _blend_pixel(pixels, canvas_width, x0 + x, y0 + y, color)
+def rects_overlap(first: Rect, second: Rect) -> bool:
+    ax, ay, aw, ah = first
+    bx, by, bw, bh = second
+    return ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah
 
 
-def _downsample_rgba(pixels: bytearray, width: int, scale: int) -> bytes:
-    output_width = width // scale
-    output = bytearray(output_width * output_width * 4)
-    samples = scale * scale
-    for output_y in range(output_width):
-        for output_x in range(output_width):
-            alpha_sum = 0
-            weighted = [0, 0, 0]
-            for sample_y in range(scale):
-                for sample_x in range(scale):
-                    source_x = output_x * scale + sample_x
-                    source_y = output_y * scale + sample_y
-                    source = (source_y * width + source_x) * 4
-                    alpha = pixels[source + 3]
-                    alpha_sum += alpha
-                    for channel in range(3):
-                        weighted[channel] += pixels[source + channel] * alpha
-            target = (output_y * output_width + output_x) * 4
-            if alpha_sum:
-                for channel in range(3):
-                    output[target + channel] = round(weighted[channel] / alpha_sum)
-            output[target + 3] = round(alpha_sum / samples)
-    return bytes(output)
+def cell_width(char: str) -> int:
+    if unicodedata.combining(char) or char in "‍︎️":
+        return 0
+    if unicodedata.east_asian_width(char) in {"W", "F"}:
+        return 2
+    return 1
+
+
+def clip_to_width(text: str, width: int) -> str:
+    """The longest prefix of text that fits in width terminal cells."""
+
+    clipped: List[str] = []
+    used = 0
+    for char in text:
+        if char < " " or char == "\x7f":
+            char = " "
+        needed = cell_width(char)
+        if used + needed > width:
+            break
+        clipped.append(char)
+        used += needed
+    return "".join(clipped)
+
+
+def move_to(x: int, y: int) -> str:
+    """Cursor position for zero-based popup cell (x, y)."""
+
+    return f"{ESC}[{y + 1};{x + 1}H"
+
+
+class Screen:
+    """Accumulates drawing for a popup of a fixed size, clipping at its edges."""
+
+    def __init__(self, width: int, height: int) -> None:
+        self.width = width
+        self.height = height
+        self.parts: List[str] = []
+
+    def text(self, x: int, y: int, text: str, style: str = "") -> None:
+        if y < 0 or y >= self.height or x >= self.width:
+            return
+        if x < 0:
+            text = text[-x:]
+            x = 0
+        visible = clip_to_width(text, self.width - x)
+        if visible:
+            self.parts.append(f"{move_to(x, y)}{style}{visible}{RESET}")
+
+    def raw(self, sequence: str) -> None:
+        self.parts.append(sequence)
+
+    def render(self) -> str:
+        return "".join(self.parts)
+
+
+def kitty_image(png: bytes, cols: int, rows: int, image_id: int) -> str:
+    """Transmit and place a PNG at the cursor, scaled to cols x rows cells.
+
+    C=1 keeps the cursor still and q=2 silences replies, so the image never
+    disturbs the text layout drawn around it.
+    """
+
+    encoded = base64.b64encode(png).decode("ascii")
+    chunks = [
+        encoded[start : start + KITTY_CHUNK_SIZE]
+        for start in range(0, len(encoded), KITTY_CHUNK_SIZE)
+    ] or [""]
+    sequences = []
+    for index, chunk in enumerate(chunks):
+        more = 1 if index < len(chunks) - 1 else 0
+        if index == 0:
+            control = f"a=T,f=100,t=d,q=2,C=1,i={image_id},c={cols},r={rows},m={more}"
+        else:
+            control = f"m={more}"
+        sequences.append(f"{ESC}_G{control};{chunk}{ESC}\\")
+    return "".join(sequences)
+
+
+def delete_images() -> str:
+    return f"{ESC}_Ga=d,d=A,q=2{ESC}\\"
 
 
 def render_badge_png(char: str) -> Optional[bytes]:
@@ -377,7 +395,7 @@ def build_badge_assets() -> int:
     """Pre-render every hint so opening the picker never initializes Pillow."""
 
     BADGE_ASSET_DIR.mkdir(parents=True, exist_ok=True)
-    for char in HINT_ALPHABET:
+    for char in string.ascii_lowercase:
         payload = render_badge_png(char)
         if payload is None:
             raise RuntimeError("Pillow and a rounded system font are required to build badges")
@@ -385,163 +403,182 @@ def build_badge_assets() -> int:
     return 0
 
 
-def _paint_dot_glyph(
-    pixels: bytearray, width: int, glyph: Sequence[str], scale: int
-) -> None:
-    glyph_cell = 5 * scale
-    glyph_block = 4 * scale
-    glyph_width = 5 * glyph_cell
-    glyph_height = 7 * glyph_cell
-    start_x = (width - glyph_width) // 2
-    start_y = (width - glyph_height) // 2
-    for row_index, row in enumerate(glyph):
-        for column_index, bit in enumerate(row):
-            if bit != "1":
-                continue
-            _paint_rounded_rect(
-                pixels,
-                width,
-                start_x + column_index * glyph_cell,
-                start_y + row_index * glyph_cell,
-                glyph_block,
-                glyph_block,
-                scale,
-                (250, 252, 255, 255),
-            )
+def draw_dividers(screen: Screen, rect: Rect, content: Rect) -> None:
+    """Line every edge of rect that the pane's content does not reach."""
+
+    x, y, width, height = rect
+    content_x, content_y, content_width, content_height = content
+    left, top = to_popup(x, y)
+    right = left + width - 1
+    bottom = top + height - 1
+    if content_y > y:
+        screen.text(left, top, "─" * width, DIVIDER_STYLE)
+    if content_y + content_height < y + height:
+        screen.text(left, bottom, "─" * width, DIVIDER_STYLE)
+    for row in range(top, bottom + 1):
+        if content_x > x:
+            screen.text(left, row, "│", DIVIDER_STYLE)
+        if content_x + content_width < x + width:
+            screen.text(right, row, "│", DIVIDER_STYLE)
 
 
-def render_badge_rgba(
-    char: str, _cell_width: int, _cell_height: int
-) -> Tuple[int, int, bytes]:
-    glyph = FONT_5X7.get(char.upper())
-    if glyph is None:
-        raise ValueError(f"unsupported hint character: {char!r}")
+def draw_snapshot(screen: Screen, content: Rect, lines: Sequence[str]) -> None:
+    x, y, width, height = content
+    popup_x, popup_y = to_popup(x, y)
+    for row, line in enumerate(lines[:height]):
+        screen.text(popup_x, popup_y + row, clip_to_width(line, width), SNAPSHOT_STYLE)
 
-    scale = BADGE_SUPERSAMPLE * BADGE_IMAGE_SIZE // BADGE_DESIGN_SIZE
-    output_size = BADGE_IMAGE_SIZE
-    width = BADGE_DESIGN_SIZE * scale
-    pixels = bytearray(width * width * 4)
 
-    # A soft shadow and a single luminous surface read as a keyboard key,
-    # unlike the old border-plus-dark-inset design which resembled a phone.
-    _paint_rounded_rect(
-        pixels,
-        width,
-        7 * scale,
-        8 * scale,
-        50 * scale,
-        50 * scale,
-        15 * scale,
-        (6, 10, 24, 105),
+def draw_badge(screen: Screen, char: str, badge: Rect, image_id: int) -> None:
+    x, y, cols, rows = badge
+    popup_x, popup_y = to_popup(x, y)
+    fallback_cols = min(FALLBACK_BADGE_COLS, cols)
+    fallback = char.upper().center(fallback_cols)
+    screen.text(
+        popup_x + (cols - fallback_cols) // 2,
+        popup_y + (rows - 1) // 2,
+        fallback,
+        FALLBACK_BADGE_STYLE,
     )
-    _paint_rounded_rect(
-        pixels,
-        width,
-        5 * scale,
-        4 * scale,
-        54 * scale,
-        54 * scale,
-        17 * scale,
-        (202, 220, 255, 245),
-    )
-    _paint_rounded_gradient(
-        pixels,
-        width,
-        7 * scale,
-        6 * scale,
-        50 * scale,
-        50 * scale,
-        15 * scale,
-        (137, 177, 255, 255),
-        (76, 112, 222, 255),
-    )
-    _paint_rounded_rect(
-        pixels,
-        width,
-        10 * scale,
-        8 * scale,
-        44 * scale,
-        15 * scale,
-        10 * scale,
-        (255, 255, 255, 24),
-    )
-
-    _paint_dot_glyph(pixels, width, glyph, scale)
-    return output_size, output_size, _downsample_rgba(pixels, width, width // output_size)
-
-
-def render_badge_payload(
-    char: str, cell_width: int, cell_height: int
-) -> Tuple[str, int, int, bytes]:
     png = load_badge_png(char)
-    if png is None:
-        png = render_badge_png(char)
-    if png is not None:
-        return "png", BADGE_IMAGE_SIZE, BADGE_IMAGE_SIZE, png
-    width, height, rgba = render_badge_rgba(char, cell_width, cell_height)
-    return "rgba", width, height, rgba
-
-
-def graphics_params(
-    char: str, pane: Mapping[str, Any], cell_width: int, cell_height: int
-) -> Dict[str, Any]:
-    image_format, image_width, image_height, image = render_badge_payload(
-        char, cell_width, cell_height
-    )
-    return {
-        "pane_id": str(pane["pane_id"]),
-        "format": image_format,
-        "image_width": image_width,
-        "image_height": image_height,
-        "data_base64": base64.b64encode(image).decode("ascii"),
-        "placement": badge_placement(pane.get("rect", {})),
-    }
-
-
-def clear_hints(
-    pane_ids: Iterable[str], request: Callable[[str, Mapping[str, Any]], Dict[str, Any]] = api_request
-) -> None:
-    unique_pane_ids = list(dict.fromkeys(pane_ids))
-    if not unique_pane_ids:
+    if png is None or popup_x < 0 or popup_y < 0:
         return
-
-    def clear_one(pane_id: str) -> None:
-        try:
-            request("pane.graphics.clear", {"pane_id": pane_id})
-        except (HerdrApiError, RuntimeError) as error:
-            log_error(f"could not clear hint from {pane_id}: {error}")
-
-    # Herdr handles these tiny local-socket requests much faster sequentially.
-    # Multiple simultaneous socket clients contend with its render loop and can
-    # turn a few milliseconds of work into roughly a tenth of a second.
-    for pane_id in unique_pane_ids:
-        clear_one(pane_id)
+    screen.raw(move_to(popup_x, popup_y) + kitty_image(png, cols, rows, image_id))
 
 
-def show_hints(
+def legend_lines(
+    hints: Sequence[Tuple[str, str]], current_hint: Optional[str]
+) -> List[Tuple[str, str, str]]:
+    """Rows of (marker, hint, label) under the title, one per pane."""
+
+    return [("*" if hint == current_hint else " ", hint, label) for hint, label in hints]
+
+
+def legend_size(hints: Sequence[Tuple[str, str]], title: str, max_width: int) -> Tuple[int, int]:
+    widest_row = max((6 + len(label) for _, label in hints), default=0)
+    width = min(max_width, max(len(title), widest_row) + 4)
+    height = len(hints) + 4
+    return width, height
+
+
+def legend_origin(
+    size: Tuple[int, int], screen_size: Tuple[int, int], badges: Sequence[Rect]
+) -> Tuple[int, int]:
+    """Centre the legend unless that hides a badge; then try the top and bottom."""
+
+    width, height = size
+    screen_width, screen_height = screen_size
+    x = max(0, (screen_width - width) // 2)
+    candidates = [
+        max(0, (screen_height - height) // 2),
+        0,
+        max(0, screen_height - height),
+    ]
+    popup_badges = [(*to_popup(bx, by), bw, bh) for bx, by, bw, bh in badges]
+    for y in candidates:
+        if not any(rects_overlap((x, y, width, height), badge) for badge in popup_badges):
+            return x, y
+    return x, candidates[0]
+
+
+def draw_legend(
+    screen: Screen,
+    hints: Sequence[Tuple[str, str]],
+    current_hint: Optional[str],
+    badges: Sequence[Rect],
+) -> None:
+    keys = "".join(hint for hint, _ in hints)
+    title = f"Pane picker  {keys}  ·  Esc/Ctrl-G cancels"
+    width, height = legend_size(hints, title, screen.width)
+    x, y = legend_origin((width, height), (screen.width, screen.height), badges)
+    inner = width - 2
+
+    screen.text(x, y, "╭" + "─" * inner + "╮", LEGEND_BORDER_STYLE)
+    rows: List[str] = [title, ""]
+    rows.extend(f"{marker} {hint}  {label}" for marker, hint, label in legend_lines(hints, current_hint))
+    for offset, row in enumerate(rows, start=1):
+        screen.text(x, y + offset, "│", LEGEND_BORDER_STYLE)
+        screen.text(x + 1, y + offset, " " + clip_to_width(row, inner - 2).ljust(inner - 1), LEGEND_STYLE)
+        screen.text(x + width - 1, y + offset, "│", LEGEND_BORDER_STYLE)
+    screen.text(x, y + height - 1, "╰" + "─" * inner + "╯", LEGEND_BORDER_STYLE)
+
+    title_keys_x = x + 2 + len("Pane picker  ")
+    screen.text(x + 2, y + 1, "Pane picker", LEGEND_TITLE_STYLE)
+    screen.text(title_keys_x, y + 1, keys, LEGEND_HINT_STYLE)
+    for offset, (marker, hint, _) in enumerate(legend_lines(hints, current_hint), start=3):
+        screen.text(x + 2, y + offset, marker, LEGEND_DIM_STYLE)
+        screen.text(x + 4, y + offset, hint, LEGEND_HINT_STYLE)
+
+
+def viewport_rows(info: Mapping[str, Any]) -> Optional[int]:
+    scroll = info.get("scroll")
+    rows = scroll.get("viewport_rows") if isinstance(scroll, dict) else None
+    return rows if isinstance(rows, int) else None
+
+
+def pane_display_name(info: Mapping[str, Any], pane_id: str) -> str:
+    for key in ("label", "terminal_title_stripped", "cwd"):
+        value = info.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return pane_id
+
+
+def read_visible_lines(pane_id: str, request: Request) -> List[str]:
+    try:
+        result = request("pane.read", {"pane_id": pane_id, "source": "visible", "format": "text"})
+    except HerdrApiError as error:
+        log_error(f"could not read {pane_id}: {error.code}: {error.message}")
+        return []
+    read = result.get("read", {})
+    text = read.get("text") if isinstance(read, dict) else None
+    if not isinstance(text, str):
+        text = result.get("text", "")
+    return str(text).split("\n")
+
+
+def compose_picker(
+    layout: Mapping[str, Any],
     assignments: Sequence[Tuple[str, Mapping[str, Any]]],
-    cell_width: int,
-    cell_height: int,
-    request: Callable[[str, Mapping[str, Any]], Dict[str, Any]] = api_request,
-) -> List[str]:
-    prepared = [
-        (
-            str(pane["pane_id"]),
-            graphics_params(char, pane, cell_width, cell_height),
-        )
+    pane_info: Mapping[str, Mapping[str, Any]],
+    snapshots: Mapping[str, Sequence[str]],
+    screen_size: Tuple[int, int],
+) -> str:
+    """Every byte the popup writes to show the picker."""
+
+    screen = Screen(*screen_size)
+    screen.raw(f"{ESC}[?25l{ESC}[?7l{ESC}[2J")
+    focused = layout.get("focused_pane_id")
+    zoomed = bool(layout.get("zoomed"))
+    area = rect_tuple(layout.get("area", {}))
+
+    visible = [
+        (char, str(pane["pane_id"]), area if zoomed else rect_tuple(pane.get("rect", {})))
+        for char, pane in assignments
+        if not zoomed or pane["pane_id"] == focused
+    ]
+    border = border_style(
+        [(rect, viewport_rows(pane_info.get(pane_id, {}))) for _, pane_id, rect in visible]
+    )
+
+    badges: List[Rect] = []
+    current_hint = next(
+        (char for char, pane in assignments if pane["pane_id"] == focused), None
+    )
+    for image_id, (char, pane_id, rect) in enumerate(visible, start=1):
+        content = content_rect(rect, area, border)
+        draw_dividers(screen, rect, content)
+        draw_snapshot(screen, content, snapshots.get(pane_id, []))
+        badge = badge_rect(content)
+        badges.append(badge)
+        draw_badge(screen, char, badge, image_id)
+
+    legend = [
+        (char, pane_display_name(pane_info.get(str(pane["pane_id"]), {}), str(pane["pane_id"])))
         for char, pane in assignments
     ]
-    if not prepared:
-        return []
-    shown: List[str] = []
-    try:
-        for pane_id, params in prepared:
-            request("pane.graphics.set", params)
-            shown.append(pane_id)
-    except (HerdrApiError, RuntimeError):
-        clear_hints(shown, request)
-        raise
-    return shown
+    draw_legend(screen, legend, current_hint, badges)
+    return screen.render()
 
 
 def read_selection(valid: Mapping[str, str]) -> Optional[str]:
@@ -567,143 +604,13 @@ def read_selection(valid: Mapping[str, str]) -> Optional[str]:
         termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
 
 
-def popup_header(keys: str) -> None:
-    sys.stdout.write("\x1b[2J\x1b[H\x1b[?25l")
-    sys.stdout.write(f"\x1b[1mPane picker\x1b[0m  {keys}  ·  Esc/Ctrl-G cancels")
+def write_out(text: str) -> None:
+    sys.stdout.write(text)
     sys.stdout.flush()
 
 
-def restore_popup_cursor() -> None:
-    sys.stdout.write("\x1b[?25h")
-    sys.stdout.flush()
-
-
-def read_overlay_state() -> Optional[Dict[str, Any]]:
-    try:
-        state = json.loads(OVERLAY_STATE_PATH.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    return state if isinstance(state, dict) else None
-
-
-def write_overlay_state(state: Mapping[str, Any]) -> None:
-    OVERLAY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = OVERLAY_STATE_PATH.with_name(f".{OVERLAY_STATE_PATH.name}.{os.getpid()}")
-    temporary.write_text(json.dumps(dict(state), separators=(",", ":")), encoding="utf-8")
-    temporary.replace(OVERLAY_STATE_PATH)
-
-
-def remove_overlay_state(token: str) -> None:
-    current = read_overlay_state()
-    if current is not None and current.get("token") != token:
-        return
-    try:
-        OVERLAY_STATE_PATH.unlink()
-    except FileNotFoundError:
-        pass
-
-
-def use_state_socket(state: Mapping[str, Any]) -> None:
-    socket_path = state.get("socket_path")
-    if isinstance(socket_path, str) and socket_path:
-        os.environ["HERDR_SOCKET_PATH"] = socket_path
-
-
-def clear_overlay_state(
-    state: Mapping[str, Any],
-    request: Callable[[str, Mapping[str, Any]], Dict[str, Any]] = api_request,
-) -> None:
-    use_state_socket(state)
-    pane_ids = state.get("pane_ids", [])
-    if isinstance(pane_ids, list):
-        clear_hints((str(pane_id) for pane_id in pane_ids), request=request)
-
-
-def show_overlay(
-    timeout_seconds: float = OVERLAY_TIMEOUT_SECONDS,
-    request: Callable[[str, Mapping[str, Any]], Dict[str, Any]] = api_request,
-) -> int:
-    """Draw hints without a terminal UI; WezTerm owns the next-key capture."""
-
-    current_socket_path = herdr_socket_path()
-    previous = read_overlay_state()
-    if previous is not None:
-        clear_overlay_state(previous, request=request)
-        token = previous.get("token")
-        if isinstance(token, str):
-            remove_overlay_state(token)
-        os.environ["HERDR_SOCKET_PATH"] = current_socket_path
-
-    result = request("pane.layout", {})
-    layout = result.get("layout")
-    if not isinstance(layout, dict):
-        raise RuntimeError("Herdr did not return a pane layout")
-    assignments = assign_hints(layout)
-    if len(assignments) < 2:
-        raise RuntimeError("This tab only has one pane")
-
-    # Pre-rendered PNGs and cell-grid placement do not depend on pixel geometry.
-    # Skipping pane.graphics.info removes one socket round trip from the hot path;
-    # pane.graphics.set still validates that graphics are available.
-    shown = show_hints(assignments, 0, 0, request=request)
-    token = f"{os.getpid()}-{time.monotonic_ns()}"
-    state = {
-        "version": 1,
-        "token": token,
-        "socket_path": current_socket_path,
-        "expires_at": time.time() + timeout_seconds,
-        "targets": {char: str(pane["pane_id"]) for char, pane in assignments},
-        "pane_ids": shown,
-    }
-    try:
-        write_overlay_state(state)
-    except OSError:
-        clear_hints(shown, request=request)
-        raise
-
-    deadline = time.monotonic() + timeout_seconds
-    try:
-        while time.monotonic() < deadline:
-            current = read_overlay_state()
-            if current is None or current.get("token") != token:
-                return 0
-            time.sleep(0.025)
-    finally:
-        current = read_overlay_state()
-        if current is not None and current.get("token") == token:
-            clear_overlay_state(current, request=request)
-            remove_overlay_state(token)
-    return 0
-
-
-def choose_overlay(
-    choice: Optional[str],
-    wait_seconds: float = 1.0,
-    request: Callable[[str, Mapping[str, Any]], Dict[str, Any]] = api_request,
-) -> int:
-    """Complete the overlay-only picker from WezTerm's one-shot key table."""
-
-    deadline = time.monotonic() + wait_seconds
-    state: Optional[Dict[str, Any]] = None
-    while time.monotonic() < deadline:
-        candidate = read_overlay_state()
-        if candidate is not None and float(candidate.get("expires_at", 0)) > time.time():
-            state = candidate
-            break
-        time.sleep(0.01)
-    if state is None:
-        raise RuntimeError("no active pane picker overlay")
-
-    use_state_socket(state)
-    targets = state.get("targets", {})
-    selected = targets.get(choice) if isinstance(targets, dict) and choice else None
-    if isinstance(selected, str):
-        request("pane.focus", {"pane_id": selected})
-    clear_overlay_state(state, request=request)
-    token = state.get("token")
-    if isinstance(token, str):
-        remove_overlay_state(token)
-    return 0
+def restore_popup_terminal() -> str:
+    return f"{delete_images()}{ESC}[?7h{ESC}[?25h"
 
 
 def show_error(message: str) -> None:
@@ -738,40 +645,90 @@ def log_error(message: str) -> None:
         pass
 
 
-def pick_pane() -> int:
-    result = api_request("pane.layout", {})
-    layout = result.get("layout")
+def context_pane_id(environ: Mapping[str, str] = os.environ) -> Optional[str]:
+    """The tiled pane under the popup, which carries no HERDR_PANE_ID itself."""
+
+    try:
+        context = json.loads(environ.get("HERDR_PLUGIN_CONTEXT_JSON", "") or "{}")
+    except json.JSONDecodeError:
+        return None
+    pane_id = context.get("focused_pane_id") if isinstance(context, dict) else None
+    return pane_id if isinstance(pane_id, str) and pane_id else None
+
+
+def read_layout(request: Request, pane_id: Optional[str]) -> Dict[str, Any]:
+    params = {"pane_id": pane_id} if pane_id else {}
+    layout = request("pane.layout", params).get("layout")
     if not isinstance(layout, dict):
         raise RuntimeError("Herdr did not return a pane layout")
-    picker_pane = os.environ.get("HERDR_PANE_ID", "")
-    assignments = assign_hints(layout, excluded_pane_ids={picker_pane} if picker_pane else ())
+    return layout
+
+
+def read_pane_info(request: Request, pane_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    wanted = set(pane_ids)
+    panes = request("pane.list", {}).get("panes", [])
+    return {
+        str(pane["pane_id"]): dict(pane)
+        for pane in panes
+        if isinstance(pane, dict) and pane.get("pane_id") in wanted
+    }
+
+
+def focus_choice(layout: Mapping[str, Any], selected: str, request: Request) -> None:
+    """Focus the chosen pane, unzooming first as tmux's select-pane does."""
+
+    focused = layout.get("focused_pane_id")
+    if layout.get("zoomed") and isinstance(focused, str) and selected != focused:
+        request("pane.zoom", {"pane_id": focused, "mode": "off"})
+    request("pane.focus", {"pane_id": selected})
+
+
+def pick_pane(
+    request: Request = api_request,
+    choose: Callable[[Mapping[str, str]], Optional[str]] = read_selection,
+    write: Callable[[str], None] = write_out,
+    screen_size: Optional[Tuple[int, int]] = None,
+    environ: Mapping[str, str] = os.environ,
+) -> int:
+    alphabet = hint_alphabet(environ)
+    layout = read_layout(request, context_pane_id(environ))
+    assignments = assign_hints(layout, alphabet)
     if len(assignments) < 2:
         show_error("This tab only has one pane.")
         return 0
 
+    pane_ids = [str(pane["pane_id"]) for _, pane in assignments]
+    pane_info = read_pane_info(request, pane_ids)
+    visible_ids = [layout.get("focused_pane_id")] if layout.get("zoomed") else pane_ids
+    snapshots = {
+        pane_id: read_visible_lines(pane_id, request)
+        for pane_id in visible_ids
+        if isinstance(pane_id, str)
+    }
+    if screen_size is None:
+        terminal = shutil.get_terminal_size()
+        screen_size = (terminal.columns, terminal.lines)
+
     targets = {char: str(pane["pane_id"]) for char, pane in assignments}
-    shown: List[str] = []
-    selected: Optional[str] = None
-    popup_header("".join(targets))
     try:
-        cell_width, cell_height = graphics_cell_size(str(assignments[0][1]["pane_id"]))
-        shown = show_hints(assignments, cell_width, cell_height)
-        selected = read_selection(targets)
+        write(compose_picker(layout, assignments, pane_info, snapshots, screen_size))
+        selected = choose(targets)
     finally:
-        restore_popup_cursor()
-        clear_hints(shown)
+        write(restore_popup_terminal())
     if selected:
-        api_request("pane.focus", {"pane_id": selected})
+        focus_choice(layout, selected, request)
     return 0
 
 
-def open_picker() -> int:
-    api_request(
+def open_picker(request: Request = api_request) -> int:
+    request(
         "plugin.pane.open",
         {
             "plugin_id": PLUGIN_ID,
             "entrypoint": "picker",
             "placement": "popup",
+            "width": POPUP_SIZE,
+            "height": POPUP_SIZE,
             "focus": True,
         },
     )
@@ -786,21 +743,6 @@ def main(argv: Sequence[str]) -> int:
         except RuntimeError as error:
             print(f"pane-picker: {error}", file=sys.stderr)
             return 1
-    if command == "show":
-        try:
-            return show_overlay()
-        except (HerdrApiError, RuntimeError, OSError) as error:
-            log_error(str(error))
-            print(f"pane-picker: {error}", file=sys.stderr)
-            return 1
-    if command in {"choose", "cancel"}:
-        choice = argv[2].lower() if command == "choose" and len(argv) > 2 else None
-        try:
-            return choose_overlay(choice)
-        except (HerdrApiError, RuntimeError, OSError, ValueError) as error:
-            log_error(str(error))
-            print(f"pane-picker: {error}", file=sys.stderr)
-            return 1
     if command == "open":
         try:
             return open_picker()
@@ -813,19 +755,13 @@ def main(argv: Sequence[str]) -> int:
             return pick_pane()
         except HerdrApiError as error:
             log_error(f"{error.code}: {error.message}")
-            if error.code == "feature_disabled":
-                show_error("Enable [experimental] kitty_graphics = true.")
-            else:
-                show_error(f"Herdr error: {error.message}")
+            show_error(f"Herdr error: {error.message}")
             return 1
         except RuntimeError as error:
             log_error(str(error))
             show_error(str(error))
             return 1
-    print(
-        f"usage: {Path(argv[0]).name} [build-assets|show|choose KEY|cancel|open|pick]",
-        file=sys.stderr,
-    )
+    print(f"usage: {Path(argv[0]).name} [build-assets|open|pick]", file=sys.stderr)
     return 2
 
 

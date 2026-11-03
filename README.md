@@ -4,10 +4,10 @@ Focus a Herdr pane by typing the character shown directly over it.
 
 ![Herdr Pane Picker hints over a real four-pane workspace](assets/herdr-pane-picker.png)
 
-Hints use a home-row-first alphabet: `a`, `s`, `d`, `f`, then the remaining
-letters. They follow the visual pane order from top to bottom and left to right.
-The picker does not write into pane PTYs or disturb the programs running inside
-them.
+Hints follow the visual pane order from top to bottom and left to right, using
+a home-row-first Colemak-DH alphabet: `a`, `r`, `s`, `t`, then the remaining
+letters. The picker does not write into pane PTYs or disturb the programs
+running inside them.
 
 The screenshot shows the picker over a live four-pane workspace (yazi, Claude
 Code, lazygit, shell). For captures without personal content, a fictional demo
@@ -15,47 +15,28 @@ layout ships in `scripts/` — see Documentation screenshots below.
 
 ## Requirements
 
-- macOS
-- Herdr 0.7.4 or newer
+- Linux or macOS
+- Herdr 0.9.2 or newer
 - Python 3.9 or newer
-- A Kitty-graphics-compatible outer terminal
-- Herdr's experimental Kitty graphics support enabled
+- A Kitty-graphics-compatible outer terminal for the image badges; other
+  terminals show plain letter badges
 
-The optional popup-free integration additionally requires WezTerm 20230320 or
-newer. The shipped PNG badges have no runtime Python dependencies. Pillow is
-only needed to rebuild them.
+The shipped PNG badges have no runtime Python dependencies. Pillow is only
+needed to rebuild them.
 
 ## Install
 
-Enable graphics in the existing `[experimental]` section of
-`~/.config/herdr/config.toml`:
-
-```toml
-[experimental]
-kitty_graphics = true
-```
-
-Do not add a second `[experimental]` table if one already exists. Install the
-reviewed release:
-
 ```sh
-herdr plugin install ugurtarlig/herdr-pane-picker --ref v0.1.1
+herdr plugin install ugurtarlig/herdr-pane-picker --ref v0.2.0
 ```
 
-If Kitty graphics was enabled after the current Herdr client started, detach
-and relaunch that client once so it can report terminal pixel geometry.
-
-## Portable picker
-
-Try the portable action immediately:
+Try it immediately:
 
 ```sh
 herdr plugin action invoke ugurtarlig.pane-picker.open
 ```
 
-This opens a small session-modal prompt, draws the hints over the existing
-panes, and captures the selection inside Herdr. Bind it in
-`~/.config/herdr/config.toml`:
+Bind it in `~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
@@ -71,69 +52,43 @@ Reload the configuration:
 herdr server reload-config
 ```
 
-## Popup-free WezTerm integration
-
-The fast path draws only the character badges. Herdr starts the overlay while
-WezTerm captures the next key in a one-shot key table.
-
-First bind the overlay action in Herdr:
-
-```toml
-[[keys.command]]
-key = "cmd+shift+p"
-type = "plugin_action"
-command = "ugurtarlig.pane-picker.show"
-description = "pick a pane by character hint"
-```
-
-Then load this repository as a WezTerm plugin near the end of your
-`wezterm.lua`, before returning `config`:
-
-```lua
-local pane_picker = wezterm.plugin.require(
-  "https://github.com/ugurtarlig/herdr-pane-picker"
-)
-
-pane_picker.apply_to_config(config, {
-  key = "p",
-  mods = "CMD|SHIFT",
-  is_herdr = function(_, pane)
-    return pane:get_title():lower():find("herdr", 1, true) ~= nil
-  end,
-})
-```
-
-`is_herdr` decides whether `Cmd+Shift+P` targets Herdr. Replace the example
-with your own reliable routing predicate if your Herdr pane titles do not
-contain `herdr`. Outside Herdr, the integration keeps WezTerm's native
-`PaneSelect` behavior. Inside Herdr it forwards the enhanced key sequence,
-activates the one-shot `a/s/d/f` table, and runs the plugin's selection helper.
-
-WezTerm caches Git plugins. After upgrading this plugin, run
-`wezterm.plugin.update_all()` from WezTerm's debug overlay to update the outer
-integration as well.
-
 ## Controls
 
-- Type the visible letter to focus that pane.
-- Press Escape or Ctrl-G to cancel.
-- Hints clear automatically after six seconds.
+- Type the letter shown over a pane to focus it.
+- Press Escape, Ctrl-G or Ctrl-C to cancel.
+- In a zoomed tab only the zoomed pane carries a badge; the legend lists every
+  pane, and picking another one unzooms the tab first.
+
+## Hint letters
+
+Set `HERDR_PANE_PICKER_ALPHABET` in the environment Herdr's server starts with
+to change the letters and their order. It accepts each letter `a`–`z` at most
+once; for example, QWERTY home row first:
+
+```sh
+export HERDR_PANE_PICKER_ALPHABET=asdfghjklqwertyuiopzxcvbnm
+```
 
 ## How it works
 
-The helper reads the current `pane.layout`, loads pre-rendered PNG badges, and
-sends the small `pane.graphics.set` requests sequentially. Sequential local
-socket updates are substantially faster than simultaneous connections to
-Herdr's render loop.
+Herdr 0.9.2 removed the pane graphics API, so no plugin can draw over another
+pane any more. The picker instead opens a popup that covers the whole pane
+area and paints the tab into it:
 
-The popup-free mode stores a short-lived hint-to-pane mapping in the local
-state directory. The WezTerm one-shot action starts a small selection helper,
-which calls `pane.focus`, clears every badge, and removes the state. No pane
-content or keypress is sent over the network.
+- each pane's visible text, read with `pane.read` and dimmed, at the position
+  the pane has on screen, along with the dividers between panes;
+- a badge centred on each pane, sent as a standard Kitty graphics image with a
+  plain letter underneath, so terminals without image support still show the
+  hint;
+- a legend box listing each hint with the pane's name, marking the focused
+  pane with `*`, and moving to the top or bottom edge when the centre would
+  hide a badge.
 
-If the active client cannot render Kitty graphics, the request fails without
-touching pane content. Errors are appended to
-`~/.config/herdr/plugin-state/ugurtarlig.pane-picker/errors.log`.
+The popup's border covers the outermost row and column of the pane area, so
+text in those cells does not appear in the copy.
+
+Errors are appended to `errors.log` in the plugin's state directory
+(`$HERDR_PLUGIN_STATE_DIR`).
 
 ## Local development
 
@@ -160,7 +115,7 @@ replaces an existing layout; it refuses to run against the default session.
 ```sh
 herdr --session pane-picker-demo          # in a fresh terminal window
 HERDR_SESSION=pane-picker-demo python3 scripts/demo_layout.py
-HERDR_SESSION=pane-picker-demo python3 pane_picker.py show
+HERDR_SESSION=pane-picker-demo python3 pane_picker.py open
 ```
 
 Any keypress inside a demo pane closes it. Remove the whole demo tab with:
@@ -175,9 +130,7 @@ HERDR_SESSION=pane-picker-demo python3 scripts/demo_layout.py --close
 herdr plugin uninstall ugurtarlig.pane-picker
 ```
 
-Remove the matching `[[keys.command]]` block from the Herdr configuration. If
-you enabled the WezTerm integration, remove its `plugin.require` and
-`apply_to_config` calls as well.
+Remove the matching `[[keys.command]]` block from the Herdr configuration.
 
 ## Marketplace
 

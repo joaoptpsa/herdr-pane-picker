@@ -20,21 +20,6 @@ config_path = Path(sys.argv[1]).expanduser().resolve()
 text = config_path.read_text(encoding="utf-8")
 original = text
 
-experimental_match = re.search(
-    r"(?ms)^\[experimental\][ \t]*\n(?P<body>.*?)(?=^\[[^\n]+\][ \t]*$|\Z)",
-    text,
-)
-if experimental_match is None:
-    text += "\n[experimental]\nkitty_graphics = true\n"
-else:
-    body = experimental_match.group("body")
-    graphics_line = re.compile(r"(?m)^[ \t]*#?[ \t]*kitty_graphics[ \t]*=[ \t]*(?:false|true)[ \t]*$")
-    if graphics_line.search(body):
-        body = graphics_line.sub("kitty_graphics = true", body, count=1)
-    else:
-        body = "kitty_graphics = true\n" + body
-    text = text[: experimental_match.start("body")] + body + text[experimental_match.end("body") :]
-
 plugin_action_commands = {
     'command = "ugurtarlig.pane-picker.open"',
     'command = "ugurtarlig.pane-picker.show"',
@@ -57,9 +42,9 @@ picker_block = next(
 )
 binding_body = (
     "[[keys.command]]\n"
-    'key = "cmd+shift+p"\n'
+    'key = "prefix+alt+p"\n'
     'type = "plugin_action"\n'
-    'command = "ugurtarlig.pane-picker.show"\n'
+    'command = "ugurtarlig.pane-picker.open"\n'
     'description = "pick a pane by character hint"\n'
     "\n"
 )
@@ -67,7 +52,7 @@ if picker_block is not None:
     text = text[: picker_block.start()] + binding_body + text[picker_block.end() :]
 else:
     binding = (
-        "# WezTerm-artiger Pane-Picker mit a/s/d/f-Zeichen direkt auf den Panes.\n"
+        "# Pane picker: type the letter shown over a pane to focus it.\n"
         + binding_body
     )
     ui_match = re.search(r"(?m)^\[ui\][ \t]*$", text)
@@ -108,5 +93,4 @@ PY
 "$herdr_bin" server reload-config
 "$herdr_bin" plugin action list --plugin "$plugin_id"
 
-echo "pane picker active: press cmd+shift+p"
-echo "if this client was already open, detach and relaunch it once to activate kitty_graphics"
+echo "pane picker active: press prefix+alt+p"
