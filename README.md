@@ -27,7 +27,7 @@ needed to rebuild them.
 ## Install
 
 ```sh
-herdr plugin install joaoptpsa/herdr-pane-picker --ref v0.2.0
+herdr plugin install joaoptpsa/herdr-pane-picker
 ```
 
 Try it immediately:
