@@ -373,7 +373,7 @@ class ActionTests(unittest.TestCase):
                 (
                     "plugin.pane.open",
                     {
-                        "plugin_id": "ugurtarlig.pane-picker",
+                        "plugin_id": "joaoptpsa.pane-picker",
                         "entrypoint": "picker",
                         "placement": "popup",
                         "width": "100%",

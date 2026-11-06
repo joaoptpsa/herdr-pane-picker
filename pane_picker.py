@@ -25,7 +25,7 @@ import unicodedata
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
-PLUGIN_ID = "ugurtarlig.pane-picker"
+PLUGIN_ID = "joaoptpsa.pane-picker"
 # Colemak-DH home row first, then the top and bottom rows.
 DEFAULT_HINT_ALPHABET = "arstgmneioqwfpbjluyzxcdvkh"
 ALPHABET_ENV = "HERDR_PANE_PICKER_ALPHABET"

@@ -27,13 +27,13 @@ needed to rebuild them.
 ## Install
 
 ```sh
-herdr plugin install ugurtarlig/herdr-pane-picker --ref v0.2.0
+herdr plugin install joaoptpsa/herdr-pane-picker --ref v0.2.0
 ```
 
 Try it immediately:
 
 ```sh
-herdr plugin action invoke ugurtarlig.pane-picker.open
+herdr plugin action invoke joaoptpsa.pane-picker.open
 ```
 
 Bind it in `~/.config/herdr/config.toml`:
@@ -42,7 +42,7 @@ Bind it in `~/.config/herdr/config.toml`:
 [[keys.command]]
 key = "prefix+alt+p"
 type = "plugin_action"
-command = "ugurtarlig.pane-picker.open"
+command = "joaoptpsa.pane-picker.open"
 description = "pick a pane by character hint"
 ```
 
@@ -93,7 +93,7 @@ Errors are appended to `errors.log` in the plugin's state directory
 ## Local development
 
 ```sh
-git clone https://github.com/ugurtarlig/herdr-pane-picker.git
+git clone https://github.com/joaoptpsa/herdr-pane-picker.git
 cd herdr-pane-picker
 ./activate-local.sh
 python3 -m unittest discover -s tests -v
@@ -127,7 +127,7 @@ HERDR_SESSION=pane-picker-demo python3 scripts/demo_layout.py --close
 ## Uninstall
 
 ```sh
-herdr plugin uninstall ugurtarlig.pane-picker
+herdr plugin uninstall joaoptpsa.pane-picker
 ```
 
 Remove the matching `[[keys.command]]` block from the Herdr configuration.

@@ -5,7 +5,7 @@ plugin_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 config_root=${XDG_CONFIG_HOME:-"$HOME/.config"}
 config_path=${HERDR_CONFIG_PATH:-"$config_root/herdr/config.toml"}
 herdr_bin=${HERDR_BIN_PATH:-$(command -v herdr)}
-plugin_id="ugurtarlig.pane-picker"
+plugin_id="joaoptpsa.pane-picker"
 
 python3 - "$config_path" <<'PY'
 from datetime import datetime
@@ -21,8 +21,8 @@ text = config_path.read_text(encoding="utf-8")
 original = text
 
 plugin_action_commands = {
-    'command = "ugurtarlig.pane-picker.open"',
-    'command = "ugurtarlig.pane-picker.show"',
+    'command = "joaoptpsa.pane-picker.open"',
+    'command = "joaoptpsa.pane-picker.show"',
 }
 binding_blocks = list(
     re.finditer(
@@ -44,7 +44,7 @@ binding_body = (
     "[[keys.command]]\n"
     'key = "prefix+alt+p"\n'
     'type = "plugin_action"\n'
-    'command = "ugurtarlig.pane-picker.open"\n'
+    'command = "joaoptpsa.pane-picker.open"\n'
     'description = "pick a pane by character hint"\n'
     "\n"
 )

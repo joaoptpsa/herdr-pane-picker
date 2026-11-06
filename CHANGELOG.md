@@ -83,6 +83,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Send graphics updates sequentially to avoid local-socket contention and show
   four badges in approximately 5–7 ms on the reference system.
 
-[Unreleased]: https://github.com/ugurtarlig/herdr-pane-picker/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/ugurtarlig/herdr-pane-picker/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/ugurtarlig/herdr-pane-picker/releases/tag/v0.1.0
+[Unreleased]: https://github.com/joaoptpsa/herdr-pane-picker/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/joaoptpsa/herdr-pane-picker/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/joaoptpsa/herdr-pane-picker/releases/tag/v0.1.0
